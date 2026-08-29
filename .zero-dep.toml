@@ -1,0 +1,4 @@
+track = "E"
+pitch = "A single-file, stdlib-only authenticated secrets vault, RFC-based TOTP tool, transcript-bound secure share channel, and masked secret scanner."
+
+version = "1.5.0"

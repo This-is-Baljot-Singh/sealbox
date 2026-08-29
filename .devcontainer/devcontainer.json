@@ -1,0 +1,14 @@
+{
+  "name": "sealbox Python 3.14 playground",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14-bookworm",
+  "remoteUser": "vscode",
+  "postCreateCommand": "python3 -m unittest discover -s tests -q",
+  "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "README.md",
+        "DEMO.md"
+      ]
+    }
+  }
+}

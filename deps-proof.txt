@@ -1,0 +1,16 @@
+sealbox dependency proof
+=======================
+Runtime: Python 3.14.x
+requirements.txt: EMPTY
+Runtime imports: standard library only
+Third-party runtime dependencies: 0
+Project runtime does not invoke third-party executables or services.
+
+The development playground uses GitHub Codespaces only as a browser-hosted
+Python environment. It does not install project packages and is not part of
+the sealbox runtime artifact.
+
+Final release artifact evidence (generated on the release machine):
+- Python version: record with `python3 --version`
+- Test result: record with `python3 -m unittest discover -s tests -v`
+- Reproducible artifact SHA-256: record with `sha256sum build/sealbox.pyz`

@@ -1,0 +1,21 @@
+# Local secrets / runtime state
+sealbox.vault
+sealbox.vault.*.tmp
+*.part
+
+# Python caches / environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated artifacts
+build/*.pyz
+build/sealbox.first.pyz
+sealbox-source.zip
+*.source.zip
+
+# Demo-generated files
+demo.txt
+received_demo.txt
+received_*
