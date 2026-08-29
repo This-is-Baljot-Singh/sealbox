@@ -1,0 +1,7 @@
+build/*.pyz
+build/sealbox.first.pyz
+sealbox.vault
+sealbox.vault.*.tmp
+*.part
+__pycache__/
+*.pyc
