@@ -88,12 +88,15 @@ class TestCryptoVectors(unittest.TestCase):
         self.assertNotEqual(mac1, mac2)
 
 
+<<<<<<< HEAD
     def test_totp_rejects_negative_timestamp(self):
         with self.assertRaises(ValueError):
             sealbox.totp_code(b"secret", -1)
         with self.assertRaises(ValueError):
             sealbox.totp_remaining(-1, 30)
 
+=======
+>>>>>>> origin/main
 class TestAuthenticatedEncryption(unittest.TestCase):
     def setUp(self):
         self.enc = hashlib.sha256(b"enc").digest()
@@ -252,6 +255,7 @@ class TestVault(unittest.TestCase):
 
 
 class TestShare(unittest.TestCase):
+<<<<<<< HEAD
     def test_share_file_reader_enforces_bound(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "payload.bin"
@@ -260,6 +264,8 @@ class TestShare(unittest.TestCase):
             with self.assertRaises(sealbox.SealboxError):
                 sealbox._read_bounded_file(path, 31)
 
+=======
+>>>>>>> origin/main
     def test_frame_tamper(self):
         enc = hashlib.sha256(b"e").digest()
         mac = hashlib.sha256(b"m").digest()
@@ -326,6 +332,7 @@ class TestShare(unittest.TestCase):
 
 
 class TestScanner(unittest.TestCase):
+<<<<<<< HEAD
     def test_scanner_fixture_is_shipped(self):
         fixture = Path(__file__).resolve().parents[1] / "testdata" / "fake_secrets.txt"
         self.assertTrue(fixture.is_file())
@@ -334,6 +341,8 @@ class TestScanner(unittest.TestCase):
             "aws-access-key", "secret-assignment", "private-key-header"
         })
 
+=======
+>>>>>>> origin/main
     def test_fixture_detection_and_masking(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
