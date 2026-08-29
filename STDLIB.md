@@ -1,42 +1,33 @@
 # STDLIB Log
 
-This document is the audit trail for every package-shaped problem sealbox replaces.
+The event asks for concrete stdlib-for-package substitutions. The following are the project substitutions actually used or intentionally avoided.
 
-| Would normally reach for | sealbox uses | Reason |
+| Normally reach for | sealbox uses | Rationale |
 |---|---|---|
-| `cryptography` / AES-GCM / Fernet | `hashlib`, `hmac`, `secrets`, native `int`/`pow()` | The event explicitly requires composed stdlib crypto rather than a third-party cipher. |
-| `PyNaCl` | RFC 3526 DH + HKDF + HMAC counter keystream + encrypt-then-MAC | Provides authenticated encryption composition without a package, within the event's Track E rule. |
-| `pyotp` | `hmac`, `struct`, `base64`, `time` | RFC 6238 is small enough to implement directly. |
-| `bcrypt` / `argon2-cffi` | `hashlib.scrypt` | Password stretching is available in Python's stdlib. |
-| `click` / `typer` | `argparse` | The CLI only needs standard subcommands/options. |
-| `pytest` | `unittest` | Python includes a standard test framework. |
-| `gitleaks` / `detect-secrets` | `re`, `pathlib`, a Shannon-entropy calculation | The scanner is intentionally a small, heuristic reimplementation rather than a wrapper around an external tool. |
-| `gmpy2` / bignum helpers | Python arbitrary-precision `int` + three-argument `pow()` | RFC 3526 DH modular exponentiation needs no numeric package. |
-| `protobuf` / `msgpack` | `struct` length-prefixed framing | The share protocol has a tiny fixed envelope; a serializer would add unnecessary dependency surface. |
-| `keyring` | `pathlib`, `tempfile`, `os.replace()`, `os.fsync()` | A small local file store is enough for the defined single-user scope. |
-| `colorama` | raw terminal output only | sealbox does not require color for correctness. |
-| `tqdm` | ordinary progress-free scanning output | Scanner output is small enough to avoid a progress package. |
-| `python-dotenv` | `os.environ` | The configuration surface is one optional vault-path variable. |
-| `requests` / `httpx` | no HTTP client at all | The product uses raw `socket` for its intentionally minimal P2P share protocol. |
+| `cryptography` / PyNaCl | `hashlib` + `hmac` + `secrets` + native `pow` | Event permits composed primitives; no third-party runtime dependency |
+| `pyotp` | `hmac` + `hashlib` + `base64` + `struct` + `time` | RFC 6238 is small enough to implement and test directly |
+| bcrypt / argon2-cffi | `hashlib.scrypt` | Standard-library memory-hard password KDF |
+| click / typer | `argparse` | CLI parsing is sufficient and auditable |
+| pytest | `unittest` | Standard-library test runner |
+| gitleaks / detect-secrets | `re` + `pathlib` + entropy math | Heuristic scanner is part of the project rather than an invoked dependency |
+| gmpy2 | native `int` + 3-argument `pow` | Python provides arbitrary-precision integers and modular exponentiation |
+| protobuf / msgpack | `struct` length-prefix framing | Wire format is intentionally tiny |
+| keyring | local authenticated vault over `pathlib`/`os` | Persistent local storage without a package or daemon |
+| colorama | raw ANSI / stderr | No runtime dependency for optional terminal presentation |
+| python-dotenv | `os.environ` | Configuration surface is intentionally tiny |
+| tqdm | simple loop/progress output | Scanner does not need a progress-bar package |
+| rich | plain structured stdout/stderr | Predictable machine-readable output is preferable for a security CLI |
+| psutil | `resource`/`time` only where measurement is actually needed | Benchmark avoids another runtime package |
+| requests/httpx | `socket` for share transport | Share is intentionally a raw TCP protocol |
 
-## Crypto-specific stdlib choices
+## Important boundary
 
-### Password KDF
+The event's Track E rule is not “never write cryptographic code.” It says not to roll an original cipher; compose the standard library correctly. The project therefore uses RFC-specified DH, HKDF, HMAC and TOTP constructions and documents the composition explicitly.
 
-`hashlib.scrypt` accepts explicit `n`, `r`, `p`, `dklen`, and `maxmem`. The release configuration is N=32768, r=8, p=1, dklen=32 and maxmem=64 MiB. The salt is random 16 bytes per vault. The explicit memory limit is retained because OpenSSL-backed scrypt has conservative defaults.
+## Password KDF disclosure
 
-### Key separation
+Python 3.14 exposes `hashlib.scrypt`. The event specification selects `n=2**15, r=8, p=1, maxmem=64 MiB`. OWASP currently publishes stronger scrypt choices for general password storage, including `N=2^17,r=8,p=1`; sealbox intentionally retains the event setting and documents the tradeoff rather than presenting it as universal guidance. urlOWASP Password Storage Cheat Sheethttps://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
 
-A single derived input is passed through HKDF, then separate information strings produce independent encryption and MAC keys. The strings include `sealbox/v1/` domain separation to avoid cross-protocol reuse.
+## Release dependency evidence
 
-### Authentication ordering
-
-The receiver computes and constant-time compares the authentication tag before invoking the keystream/XOR decryption path. This is an explicit fail-closed property.
-
-## Source originality
-
-The implementation in this repository is written for the event. No third-party source is vendored into `sealbox.py`.
-
-## Performance disclosure
-
-This design deliberately favors readability, bounded scope and judge-auditable correctness over throughput. A real audited AEAD library is generally preferable outside this event. The point here is to demonstrate what Python's standard library can compose while respecting the event rule.
+`requirements.txt` is empty. `release_check.sh` parses `sealbox.py` with the Python AST and compares imported top-level modules with `sys.stdlib_module_names`, then runs the artifact under `python -I -S`.

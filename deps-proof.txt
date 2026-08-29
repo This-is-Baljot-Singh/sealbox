@@ -1,16 +1,17 @@
-Dependency proof is generated at submission time.
+sealbox dependency proof
+========================
 
-Required evidence:
-1. python3 --version (must be the pinned Python 3.14 toolchain used for release)
-2. python3 -m pip list --format=freeze (runtime manifest is empty; any packages shown here are tooling/environment only)
-3. grep/import audit showing sealbox.py imports stdlib modules only
-4. two consecutive build hashes of build/sealbox.pyz
+Release procedure (run on the final Python 3.14.x submission machine):
 
-Example release commands:
   python3 --version
+  cat requirements.txt
   python3 -m pip list --format=freeze
-  python3 -m py_compile sealbox.py
-  ./build.sh
-  cp build/sealbox.pyz build/sealbox.first.pyz
-  ./build.sh
-  sha256sum build/sealbox.first.pyz build/sealbox.pyz
+  ./release_check.sh
+
+Interpretation:
+- requirements.txt MUST be empty.
+- pip itself may appear in the environment; pip is development/environment tooling, not a sealbox runtime dependency.
+- release_check.sh performs the runtime import audit against sys.stdlib_module_names and executes the artifact with python -I -S.
+- The final SHA-256 printed by ./build.sh is the hash of the exact submission artifact.
+
+Final release values must be recorded from the actual submission machine. Do not copy hashes from another environment.

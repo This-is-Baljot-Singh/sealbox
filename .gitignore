@@ -1,7 +1,16 @@
-build/*.pyz
-build/sealbox.first.pyz
+# Local secrets / runtime state
 sealbox.vault
 sealbox.vault.*.tmp
 *.part
+
+# Python caches / environments
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+
+# Generated artifacts
+build/*.pyz
+build/sealbox.first.pyz
+sealbox-source.zip
+*.source.zip

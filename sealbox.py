@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import getpass
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ import re
 import secrets
 import socket
 import stat
+import statistics
 import struct
 import sys
 import tempfile
@@ -36,7 +38,7 @@ from typing import BinaryIO, Iterable, Iterator, Sequence
 # ---------------------------------------------------------------------------
 
 APP_NAME = "sealbox"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.3.0"
 VAULT_MAGIC = b"SBX1"
 VAULT_VERSION = 1
 HEADER_STRUCT = struct.Struct(">4sH16sIII")
@@ -49,6 +51,7 @@ MAX_RECORD_BYTES = 16 * 1024 * 1024
 MAX_SHARE_BYTES = 64 * 1024 * 1024
 MAX_FRAME_BYTES = MAX_SHARE_BYTES + 4096
 SOCKET_TIMEOUT = 15.0
+FINGERPRINT_SIZE = 16
 
 SCRYPT_N = 2**15
 SCRYPT_R = 8
@@ -72,10 +75,12 @@ DH_P = int(
 )
 DH_G = 2
 
-HKDF_INFO_ENC = b"sealbox/v1/enc"
-HKDF_INFO_MAC = b"sealbox/v1/mac"
+SHARE_KDF_CONTEXT = b"sealbox/share/v2"
+HKDF_INFO_ENC = b"sealbox/v2/enc"
+HKDF_INFO_MAC = b"sealbox/v2/mac"
 HKDF_INFO_VAULT_ENC = b"sealbox/v1/vault-enc"
 HKDF_INFO_VAULT_MAC = b"sealbox/v1/vault-mac"
+FINGERPRINT_DOMAIN = b"sealbox/fingerprint/v2"
 PASSWORD_VERIFY_NAME = b"__sealbox_verify__"
 INTEGRITY_NAME = b"__sealbox_integrity__"
 PASSWORD_VERIFY_VALUE = b"sealbox-password-verifier-v1"
@@ -118,9 +123,10 @@ def xor_bytes(left: bytes, right: bytes) -> bytes:
 def _validate_password(password: str) -> bytes:
     # UTF-8 is the stable external representation; reject absurd input that
     # would make KDF work needlessly expensive and inconsistent across tools.
-    if not 1 <= len(password) <= 1024:
-        raise SealboxError("master password must be 1..1024 Unicode characters")
-    return password.encode("utf-8", "surrogatepass")
+    encoded = password.encode("utf-8", "surrogatepass")
+    if not 1 <= len(encoded) <= 1024:
+        raise SealboxError("master password must be 1..1024 UTF-8 bytes")
+    return encoded
 
 
 def _set_private_mode(path: Path) -> None:
@@ -142,6 +148,21 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _reject_vault_symlink(path: Path) -> None:
+    try:
+        if path.is_symlink():
+            raise SealboxError(f"refusing to use symlink vault path: {path}")
+    except OSError as exc:
+        raise SealboxError(f"cannot inspect vault path: {exc}") from exc
+
+
+def _ensure_private_parent(path: Path) -> None:
+    parent = path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, mode=0o700)
+        _set_private_mode(parent)
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +223,25 @@ def dh_shared_secret(private: int, peer_public: int) -> bytes:
     return shared_int.to_bytes(DH_SIZE, "big")
 
 
-def derive_share_keys(shared_secret: bytes) -> tuple[bytes, bytes]:
-    # Fixed empty salt gives the same deterministic derivation both directions;
-    # domain-separated info values keep encryption and MAC keys independent.
+def derive_share_keys(
+    shared_secret: bytes, local_public: bytes, peer_public: bytes
+) -> tuple[bytes, bytes]:
+    """Derive share keys, binding them to the two DH public values.
+
+    The public values are sorted so both endpoints derive the same context
+    without introducing a role-dependent key schedule. Binding the transcript
+    prevents the working keys from being independent of the negotiated DH
+    context and makes the fingerprint commit to the same session transcript.
+    """
+    if len(local_public) != DH_SIZE or len(peer_public) != DH_SIZE:
+        raise ValueError("DH public values must be exactly 256 bytes")
     prk = hkdf_extract(b"", shared_secret)
+    low, high = sorted((local_public, peer_public))
+    context = SHARE_KDF_CONTEXT + low + high
+    context_hash = hashlib.sha256(context).digest()
     return (
-        hkdf_expand(prk, HKDF_INFO_ENC, 32),
-        hkdf_expand(prk, HKDF_INFO_MAC, 32),
+        hkdf_expand(prk, HKDF_INFO_ENC + context_hash, 32),
+        hkdf_expand(prk, HKDF_INFO_MAC + context_hash, 32),
     )
 
 
@@ -251,13 +284,21 @@ def decrypt_then_verify(enc_key: bytes, mac_key: bytes, nonce: bytes, ciphertext
     return xor_bytes(ciphertext, stream)
 
 
+def _validate_scrypt_params(n: int, r: int, p: int) -> None:
+    # Vault format version 1 uses one fixed, audited parameter set. Rejecting
+    # attacker-controlled work factors before invoking scrypt prevents a
+    # corrupted vault header from becoming an unbounded CPU/RAM DoS.
+    if (n, r, p) != (SCRYPT_N, SCRYPT_R, SCRYPT_P):
+        raise FormatError(
+            f"unsupported vault scrypt parameters: n={n}, r={r}, p={p}; "
+            f"expected n={SCRYPT_N}, r={SCRYPT_R}, p={SCRYPT_P}"
+        )
+
+
 def password_keys(password: str, salt: bytes, n: int, r: int, p: int) -> tuple[bytes, bytes]:
     if len(salt) < 16:
         raise FormatError("vault KDF salt is too short")
-    if n < 2 or n & (n - 1):
-        raise FormatError("vault scrypt N must be a power of two >= 2")
-    if r <= 0 or p <= 0:
-        raise FormatError("vault scrypt parameters are invalid")
+    _validate_scrypt_params(n, r, p)
     raw = hashlib.scrypt(
         _validate_password(password),
         salt=salt,
@@ -296,10 +337,26 @@ class VaultRecord:
     tag: bytes
 
 
-def _encode_record(record: VaultRecord) -> bytes:
-    name_bytes = record.name.encode("utf-8")
-    if not name_bytes or len(name_bytes) > MAX_NAME_BYTES:
+def _validate_entry_name(name: str) -> None:
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SealboxError("entry name is not valid UTF-8") from exc
+    if not name or len(encoded) > MAX_NAME_BYTES:
         raise SealboxError("entry name must be 1..1024 UTF-8 bytes")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise SealboxError("entry name contains control characters")
+
+
+def _validate_user_entry_name(name: str) -> None:
+    _validate_entry_name(name)
+    if name in {PASSWORD_VERIFY_NAME.decode(), INTEGRITY_NAME.decode()}:
+        raise SealboxError("reserved entry name")
+
+
+def _encode_record(record: VaultRecord) -> bytes:
+    _validate_entry_name(record.name)
+    name_bytes = record.name.encode("utf-8")
     if len(record.nonce) != NONCE_SIZE:
         raise ValueError("invalid nonce")
     if len(record.ciphertext) > MAX_RECORD_BYTES:
@@ -337,6 +394,7 @@ def _parse_vault(raw: bytes) -> tuple[VaultHeader, list[VaultRecord]]:
     header = VaultHeader(version, salt, n, r, p)
     pos = HEADER_STRUCT.size
     records: list[VaultRecord] = []
+    seen_names: set[str] = set()
     while pos < len(raw):
         if len(raw) - pos < RECORD_PREFIX_STRUCT.size:
             raise FormatError("truncated vault record prefix")
@@ -353,12 +411,25 @@ def _parse_vault(raw: bytes) -> tuple[VaultHeader, list[VaultRecord]]:
             name = raw[pos : pos + name_len].decode("utf-8")
         except UnicodeDecodeError as exc:
             raise FormatError("entry name is not valid UTF-8") from exc
+        try:
+            _validate_entry_name(name)
+        except SealboxError as exc:
+            raise FormatError(str(exc)) from exc
+        if name in seen_names:
+            raise AuthenticationError("duplicate vault record")
+        seen_names.add(name)
         pos += name_len
         ciphertext = raw[pos : pos + ct_len]
         pos += ct_len
         tag = raw[pos : pos + TAG_SIZE]
         pos += TAG_SIZE
         records.append(VaultRecord(name, nonce, ciphertext, tag))
+    verifier_count = sum(r.name == PASSWORD_VERIFY_NAME.decode() for r in records)
+    integrity_count = sum(r.name == INTEGRITY_NAME.decode() for r in records)
+    if verifier_count != 1:
+        raise AuthenticationError("vault password verifier is missing or duplicated")
+    if integrity_count != 1:
+        raise AuthenticationError("vault integrity record is missing or duplicated")
     return header, records
 
 
@@ -377,7 +448,9 @@ class Vault:
 
     @classmethod
     def create(cls, path: Path, password: str) -> "Vault":
-        if Path(path).exists():
+        path = Path(path).expanduser()
+        _reject_vault_symlink(path)
+        if path.exists():
             raise SealboxError(f"vault already exists: {path}")
         _validate_password(password)
         header = VaultHeader(
@@ -391,7 +464,7 @@ class Vault:
         nonce, ciphertext, tag = encrypt_then_mac(enc_key, mac_key, PASSWORD_VERIFY_VALUE)
         records = [VaultRecord(PASSWORD_VERIFY_NAME.decode(), nonce, ciphertext, tag)]
         vault = cls.__new__(cls)
-        vault.path = Path(path)
+        vault.path = path
         vault.password = password
         vault.header = header
         vault.records = records
@@ -402,8 +475,10 @@ class Vault:
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Vault":
+        path = Path(path).expanduser()
+        _reject_vault_symlink(path)
         try:
-            raw = Path(path).read_bytes()
+            raw = path.read_bytes()
         except OSError as exc:
             raise SealboxError(f"cannot read vault: {exc}") from exc
         header, records = _parse_vault(raw)
@@ -428,18 +503,14 @@ class Vault:
         return hmac_sha256(self.mac_key, bytes(canonical))
 
     def _verify_password(self) -> None:
-        verifier = next((r for r in self.records if r.name == PASSWORD_VERIFY_NAME.decode()), None)
-        if verifier is None:
-            raise AuthenticationError("vault password verifier is missing")
+        verifier = next(r for r in self.records if r.name == PASSWORD_VERIFY_NAME.decode())
         plaintext = decrypt_then_verify(
             self.enc_key, self.mac_key, verifier.nonce, verifier.ciphertext, verifier.tag
         )
         if not hmac.compare_digest(plaintext, PASSWORD_VERIFY_VALUE):
             raise AuthenticationError("incorrect master password")
 
-        integrity = next((r for r in self.records if r.name == INTEGRITY_NAME.decode()), None)
-        if integrity is None:
-            raise AuthenticationError("vault integrity record is missing")
+        integrity = next(r for r in self.records if r.name == INTEGRITY_NAME.decode())
         stored_digest = decrypt_then_verify(
             self.enc_key, self.mac_key, integrity.nonce, integrity.ciphertext, integrity.tag
         )
@@ -461,7 +532,7 @@ class Vault:
         for record in self.records:
             payload.extend(_encode_record(record))
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_parent(self.path)
         fd, tmp_name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=self.path.parent)
         tmp_path = Path(tmp_name)
         try:
@@ -509,8 +580,7 @@ class Vault:
         )
 
     def put(self, name: str, value: bytes) -> None:
-        if not name or name in {PASSWORD_VERIFY_NAME.decode(), INTEGRITY_NAME.decode()}:
-            raise SealboxError("invalid entry name")
+        _validate_user_entry_name(name)
         if len(value) > MAX_RECORD_BYTES:
             raise SealboxError("secret exceeds 16 MiB")
         replacement = self._make_record(name, value)
@@ -520,13 +590,17 @@ class Vault:
         self._write()
 
     def remove(self, name: str) -> None:
-        if name == PASSWORD_VERIFY_NAME.decode():
+        if name in {PASSWORD_VERIFY_NAME.decode(), INTEGRITY_NAME.decode()}:
             raise NotFoundError(name)
         old = len(self.records)
         self.records = [r for r in self.records if r.name != name]
         if len(self.records) == old:
             raise NotFoundError(name)
         self._write()
+
+    def verify(self) -> None:
+        """Verify password and whole-vault integrity; raise on any failure."""
+        self._verify_password()
 
     def stats(self) -> dict[str, object]:
         st = self.path.stat()
@@ -600,7 +674,7 @@ def _recv_length_prefixed(sock: socket.socket, max_len: int) -> bytes:
     return _recv_exact(sock, length)
 
 
-def _dh_handshake(sock: socket.socket) -> tuple[bytes, bytes]:
+def _dh_handshake(sock: socket.socket) -> tuple[bytes, bytes, str]:
     private, public = dh_generate_keypair()
     public_bytes = public.to_bytes(DH_SIZE, "big")
     # Symmetric send-then-receive avoids role-dependent framing.
@@ -611,7 +685,39 @@ def _dh_handshake(sock: socket.socket) -> tuple[bytes, bytes]:
     peer_public = int.from_bytes(peer_bytes, "big")
     dh_validate_public(peer_public)
     shared = dh_shared_secret(private, peer_public)
-    return derive_share_keys(shared)
+    low, high = sorted((public_bytes, peer_bytes))
+    transcript = SHARE_KDF_CONTEXT + low + high
+    enc_key, mac_key = derive_share_keys(shared, public_bytes, peer_bytes)
+    fingerprint = hashlib.sha256(FINGERPRINT_DOMAIN + transcript + shared).hexdigest()[: FINGERPRINT_SIZE * 2]
+    return enc_key, mac_key, fingerprint
+
+
+def _normalize_fingerprint(value: str) -> str:
+    expected_len = FINGERPRINT_SIZE * 2
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F\s:-]+", value):
+        raise SealboxError("fingerprint may contain only hexadecimal digits, spaces, ':' or '-'")
+    normalized = re.sub(r"[\s:-]", "", value).lower()
+    if len(normalized) != expected_len:
+        raise SealboxError(f"fingerprint must contain exactly {expected_len} hexadecimal characters")
+    return normalized
+
+
+def _verify_fingerprint(actual: str, expected: str | None) -> None:
+    if expected is None:
+        return
+    normalized = _normalize_fingerprint(expected)
+    if not hmac.compare_digest(actual, normalized):
+        raise AuthenticationError("share session fingerprint mismatch")
+
+
+def _confirm_fingerprint(actual: str) -> None:
+    """Require the user to compare this session fingerprint out-of-band."""
+    formatted = _format_fingerprint(actual)
+    print(f"Session fingerprint: {formatted}", file=sys.stderr)
+    entered = input("Compare with peer and enter peer fingerprint (blank to cancel): ").strip()
+    if not entered:
+        raise AuthenticationError("share fingerprint confirmation cancelled")
+    _verify_fingerprint(actual, entered)
 
 
 def _build_share_envelope(kind: str, name: str | None, content: bytes) -> bytes:
@@ -684,16 +790,36 @@ def share_decrypt_frame(enc_key: bytes, mac_key: bytes, frame: bytes) -> bytes:
     return decrypt_then_verify(enc_key, mac_key, nonce, ciphertext, tag)
 
 
-def share_send(host: str, port: int, kind: str, name: str | None, content: bytes) -> None:
+def share_send(
+    host: str,
+    port: int,
+    kind: str,
+    name: str | None,
+    content: bytes,
+    show_fingerprint: bool = False,
+    expected_fingerprint: str | None = None,
+    confirm_fingerprint: bool = False,
+) -> None:
     with socket.create_connection((host, port), timeout=SOCKET_TIMEOUT) as sock:
         sock.settimeout(SOCKET_TIMEOUT)
-        enc_key, mac_key = _dh_handshake(sock)
+        enc_key, mac_key, fingerprint = _dh_handshake(sock)
+        _verify_fingerprint(fingerprint, expected_fingerprint)
+        if confirm_fingerprint:
+            _confirm_fingerprint(fingerprint)
+        elif show_fingerprint:
+            print(f"Session fingerprint: {_format_fingerprint(fingerprint)}", file=sys.stderr)
         envelope = _build_share_envelope(kind, name, content)
         frame = share_encrypt_frame(enc_key, mac_key, envelope)
         _send_length_prefixed(sock, frame)
 
 
-def share_receive(host: str, port: int) -> tuple[str, str | None, bytes]:
+def share_receive(
+    host: str,
+    port: int,
+    show_fingerprint: bool = False,
+    expected_fingerprint: str | None = None,
+    confirm_fingerprint: bool = False,
+) -> tuple[str, str | None, bytes]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((host, port))
@@ -702,7 +828,12 @@ def share_receive(host: str, port: int) -> tuple[str, str | None, bytes]:
         conn, _addr = listener.accept()
         with conn:
             conn.settimeout(SOCKET_TIMEOUT)
-            enc_key, mac_key = _dh_handshake(conn)
+            enc_key, mac_key, fingerprint = _dh_handshake(conn)
+            _verify_fingerprint(fingerprint, expected_fingerprint)
+            if confirm_fingerprint:
+                _confirm_fingerprint(fingerprint)
+            elif show_fingerprint:
+                print(f"Session fingerprint: {_format_fingerprint(fingerprint)}", file=sys.stderr)
             frame = _recv_length_prefixed(conn, MAX_FRAME_BYTES)
             plaintext = share_decrypt_frame(enc_key, mac_key, frame)
             return _parse_share_envelope(plaintext)
@@ -719,6 +850,8 @@ ASSIGNMENT_RE = re.compile(
 )
 HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
 B64_RE = re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b")
+DEFAULT_SCAN_IGNORES = (".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "build")
+PUBLIC_HEX_CONSTANT_NAMES = {"DH_P"}
 
 
 @dataclass(frozen=True)
@@ -755,22 +888,68 @@ def _looks_binary(data: bytes) -> bool:
     return bad > len(data[:8192]) * 0.02
 
 
-def iter_text_files(root: Path) -> Iterator[Path]:
+def _load_scan_ignore_file(root: Path) -> list[str]:
+    if root.is_file():
+        root = root.parent
+    ignore_file = root / ".sealboxignore"
+    if not ignore_file.is_file():
+        return []
+    try:
+        lines = ignore_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    patterns: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line.rstrip("/"))
+    return patterns
+
+
+def _is_scan_excluded(path: Path, root: Path, patterns: Sequence[str]) -> bool:
+    if root.is_file():
+        return False
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        rel = path.name
+    parts = rel.split("/")
+    for part in parts[:-1]:
+        if part in DEFAULT_SCAN_IGNORES:
+            return True
+    for pattern in patterns:
+        normalized = pattern.strip("/")
+        if not normalized:
+            continue
+        if fnmatch.fnmatchcase(rel, normalized) or any(fnmatch.fnmatchcase(part, normalized) for part in parts):
+            return True
+    return False
+
+
+def iter_text_files(root: Path, excludes: Sequence[str] = ()) -> Iterator[Path]:
     root = root.resolve()
     if root.is_file():
         yield root
         return
+    ignore_patterns = list(_load_scan_ignore_file(root)) + list(excludes)
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if any(part in {".git", ".hg", ".svn", "__pycache__", ".venv", "venv"} for part in path.parts):
+        if not path.is_file() or _is_scan_excluded(path, root, ignore_patterns):
             continue
         yield path
 
 
-def scan_path(root: Path) -> list[ScanFinding]:
+def _is_public_constant_context(line: str, token: str) -> bool:
+    stripped = line.lstrip()
+    for name in PUBLIC_HEX_CONSTANT_NAMES:
+        if stripped.startswith(name + " =") or stripped.startswith(name + "="):
+            return True
+    return "public constant" in line.lower()
+
+
+def scan_path(root: Path, excludes: Sequence[str] = ()) -> list[ScanFinding]:
     findings: list[ScanFinding] = []
-    for path in iter_text_files(root):
+    for path in iter_text_files(root, excludes):
         try:
             raw = path.read_bytes()
         except OSError:
@@ -781,8 +960,13 @@ def scan_path(root: Path) -> list[ScanFinding]:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
+        public_constant_context = False
         for line_no, line in enumerate(text.splitlines(), start=1):
             seen: set[tuple[str, str]] = set()
+            stripped = line.strip()
+            if stripped.startswith("DH_P = int("):
+                public_constant_context = True
+            suppress_entropy = public_constant_context or _is_public_constant_context(line, "")
             for label, regex in (("aws-access-key", AWS_RE), ("private-key-header", PEM_RE)):
                 for match in regex.finditer(line):
                     token = match.group(0)
@@ -799,12 +983,16 @@ def scan_path(root: Path) -> list[ScanFinding]:
             for label, regex in (("high-entropy-hex", HEX_RE), ("high-entropy-base64", B64_RE)):
                 for match in regex.finditer(line):
                     token = match.group(0)
+                    if suppress_entropy:
+                        continue
                     threshold = 3.5 if label.endswith("hex") else 4.5
                     if len(token) >= 32 and shannon_entropy(token) >= threshold:
                         key = (label, token)
                         if key not in seen:
                             findings.append(ScanFinding(path, line_no, label, mask_secret(token)))
                             seen.add(key)
+            if public_constant_context and stripped.endswith(", 16,"):
+                public_constant_context = False
     return findings
 
 
@@ -903,22 +1091,62 @@ def _decode_base32_secret(secret: str) -> bytes:
         raise SealboxError("invalid base32 TOTP secret") from exc
 
 
+def _format_fingerprint(fingerprint: str) -> str:
+    return " ".join(fingerprint[i:i+4] for i in range(0, len(fingerprint), 4))
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    vault = open_vault(args.vault)
+    vault.verify()
+    print("Vault integrity: PASS")
+    return EXIT_OK
+
+
 def cmd_share_connect(args: argparse.Namespace) -> int:
     source = Path(args.payload)
     if source.is_file():
+        try:
+            if source.stat().st_size > MAX_SHARE_BYTES:
+                raise SealboxError("file exceeds 64 MiB share limit")
+        except OSError as exc:
+            raise SealboxError(f"cannot inspect file: {exc}") from exc
         content = source.read_bytes()
-        share_send(args.host, args.port, "file", source.name, content)
+        share_send(
+            args.host,
+            args.port,
+            "file",
+            source.name,
+            content,
+            show_fingerprint=args.show_fingerprint,
+            expected_fingerprint=args.expect_fingerprint,
+            confirm_fingerprint=args.confirm_fingerprint,
+        )
         print(f"Sent {source.name} ({len(content)} bytes)")
     else:
         content = args.payload.encode("utf-8", "surrogatepass")
-        share_send(args.host, args.port, "message", None, content)
+        share_send(
+            args.host,
+            args.port,
+            "message",
+            None,
+            content,
+            show_fingerprint=args.show_fingerprint,
+            expected_fingerprint=args.expect_fingerprint,
+            confirm_fingerprint=args.confirm_fingerprint,
+        )
         print("Sent encrypted message")
     return EXIT_OK
 
 
 def cmd_share_listen(args: argparse.Namespace) -> int:
     print(f"Listening on {args.host}:{args.port} …", flush=True)
-    kind, name, content = share_receive(args.host, args.port)
+    kind, name, content = share_receive(
+        args.host,
+        args.port,
+        show_fingerprint=args.show_fingerprint,
+        expected_fingerprint=args.expect_fingerprint,
+        confirm_fingerprint=args.confirm_fingerprint,
+    )
     if kind == "message":
         sys.stdout.buffer.write(content)
         sys.stdout.buffer.write(b"\n")
@@ -946,11 +1174,47 @@ def cmd_share_listen(args: argparse.Namespace) -> int:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    findings = scan_path(Path(args.path))
+    findings = scan_path(Path(args.path), excludes=args.exclude)
     for item in findings:
         print(f"{item.path}:{item.line}: {item.rule}: {item.masked}")
     print(f"{len(findings)} finding(s)")
     return EXIT_IO if findings and args.fail_on_findings else EXIT_OK
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    print(f"sealbox {APP_VERSION} benchmark")
+    print(f"payload: {args.size} MiB")
+
+    benchmark_seed = "bench" * 8
+    password = benchmark_seed
+    samples = []
+    for _ in range(args.iterations):
+        start = time.perf_counter()
+        password_keys(password, b"0" * 16, SCRYPT_N, SCRYPT_R, SCRYPT_P)
+        samples.append((time.perf_counter() - start) * 1000)
+    print(f"scrypt: {statistics.mean(samples):.2f} ms mean / {min(samples):.2f} ms best")
+
+    samples = []
+    for _ in range(args.iterations):
+        start = time.perf_counter()
+        a_priv, _ = dh_generate_keypair()
+        _, b_pub = dh_generate_keypair()
+        dh_shared_secret(a_priv, b_pub)
+        samples.append((time.perf_counter() - start) * 1000)
+    print(f"DH shared secret: {statistics.mean(samples):.2f} ms mean / {min(samples):.2f} ms best")
+
+    payload = os.urandom(args.size * 1024 * 1024)
+    enc = hashlib.sha256(b"bench-enc").digest()
+    mac = hashlib.sha256(b"bench-mac").digest()
+    samples = []
+    for _ in range(max(1, min(args.iterations, 5))):
+        start = time.perf_counter()
+        encrypt_then_mac(enc, mac, payload)
+        samples.append(time.perf_counter() - start)
+    mean_seconds = statistics.mean(samples)
+    throughput = len(payload) / mean_seconds / (1024 * 1024) if mean_seconds else 0.0
+    print(f"encrypt {args.size} MiB: {throughput:.2f} MiB/s mean")
+    return EXIT_OK
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -1013,17 +1277,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--output")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--show-fingerprint", action="store_true", help="show the DH session fingerprint")
+    p.add_argument("--expect-fingerprint", help="require a known 32-hex-character fingerprint before receiving")
+    p.add_argument("--confirm-fingerprint", action="store_true", help="show the fingerprint and require interactive peer comparison")
     p.set_defaults(func=cmd_share_listen)
     p = share_sub.add_parser("connect", help="send a message or file")
     p.add_argument("host")
     p.add_argument("port", type=int)
     p.add_argument("payload", help="message text or path to an existing file")
+    p.add_argument("--show-fingerprint", action="store_true", help="show the DH session fingerprint")
+    p.add_argument("--expect-fingerprint", help="require a known 32-hex-character DH fingerprint before sending")
+    p.add_argument("--confirm-fingerprint", action="store_true", help="show the fingerprint and require interactive peer comparison")
     p.set_defaults(func=cmd_share_connect)
 
     p = sub.add_parser("scan", help="scan a directory or file for likely secrets")
     p.add_argument("path")
+    p.add_argument("--exclude", action="append", default=[], help="glob pattern to exclude; may be repeated")
     p.add_argument("--fail-on-findings", action="store_true")
     p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("bench", help="run a small local performance benchmark")
+    p.add_argument("--size", type=int, default=1, help="payload size in MiB (default: 1)")
+    p.add_argument("--iterations", type=int, default=3, help="iterations for KDF/DH measurements (default: 3)")
+    p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("verify", help="verify vault password and whole-file integrity")
+    p.add_argument("--vault")
+    p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("stats", help="show vault metadata")
     p.add_argument("--vault")

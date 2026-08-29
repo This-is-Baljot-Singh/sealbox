@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-python3 build_repro.py
+PYTHON="${PYTHON:-python3}"
+exec "$PYTHON" build_repro.py

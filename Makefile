@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test build clean proof check
+.PHONY: test build check proof release source-archive clean
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v
@@ -9,18 +9,24 @@ build:
 	$(PYTHON) build_repro.py
 
 check:
-	$(PYTHON) -m py_compile sealbox.py build_repro.py tests/test_sealbox.py
-	$(PYTHON) -m unittest discover -s tests -q
+	./release_check.sh
 
 proof: check
-	./build.sh > /tmp/sealbox-build-1.txt
-	cp build/sealbox.pyz build/sealbox.first.pyz
-	./build.sh > /tmp/sealbox-build-2.txt
-	sha256sum build/sealbox.first.pyz build/sealbox.pyz
-	printf '\nPython:\n'
+	printf "\nPython:\n"
 	$(PYTHON) --version
-	printf '\nInstalled third-party packages (environment evidence only):\n'
+	printf "\nRuntime manifest:\n"
+	@if [ -s requirements.txt ]; then echo "ERROR: requirements.txt is not empty"; exit 1; else echo "EMPTY"; fi
+	printf "\nEnvironment packages (evidence only):\n"
 	$(PYTHON) -m pip list --format=freeze 2>/dev/null || true
 
+release:
+	./release_check.sh
+	printf "\nFinal artifact SHA-256:\n"
+	sha256sum build/sealbox.pyz
+
+source-archive:
+	git archive --format=zip --output=sealbox-source.zip HEAD
+	@echo "created sealbox-source.zip from Git HEAD"
+
 clean:
-	rm -rf build/*.pyz build/sealbox.first.pyz __pycache__ tests/__pycache__
+	rm -rf build/*.pyz __pycache__ tests/__pycache__

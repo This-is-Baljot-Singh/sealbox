@@ -1,0 +1,14 @@
+# Repository metadata and generated files
+.git/
+.venv/
+__pycache__/
+build/
+*.pyc
+*.pyz
+*.part
+*.vault
+sealbox-source.zip
+
+# Test corpus is intentionally scanned separately
+testdata/
+tests/

@@ -1,2 +1,2 @@
 track = "E"
-pitch = "A stdlib-only secrets vault, RFC-based TOTP generator, authenticated DH share channel, and masked secret scanner."
+pitch = "A single-file, stdlib-only authenticated secrets vault, RFC-based TOTP tool, transcript-bound secure share channel, and masked secret scanner."
