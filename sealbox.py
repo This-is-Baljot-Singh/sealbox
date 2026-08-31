@@ -33,9 +33,7 @@ import time
 from dataclasses import dataclass
 from typing import BinaryIO, Iterable, Iterator, Sequence
 
-# ---------------------------------------------------------------------------
 # Version / protocol constants
-# ---------------------------------------------------------------------------
 
 APP_NAME = "sealbox"
 APP_VERSION = "1.5.0"
@@ -111,9 +109,7 @@ class NotFoundError(SealboxError):
     """A requested entry does not exist."""
 
 
-# ---------------------------------------------------------------------------
 # Secure-ish byte helpers
-# ---------------------------------------------------------------------------
 
 
 def xor_bytes(left: bytes, right: bytes) -> bytes:
@@ -167,9 +163,7 @@ def _ensure_private_parent(path: Path) -> None:
         _set_private_mode(parent)
 
 
-# ---------------------------------------------------------------------------
 # HMAC / HKDF / DH
-# ---------------------------------------------------------------------------
 
 
 def hmac_sha256(key: bytes, data: bytes) -> bytes:
@@ -247,9 +241,7 @@ def derive_share_keys(
     )
 
 
-# ---------------------------------------------------------------------------
 # Authenticated keystream composition
-# ---------------------------------------------------------------------------
 
 
 def keystream(key: bytes, nonce: bytes, length: int) -> bytes:
@@ -317,9 +309,7 @@ def password_keys(password: str, salt: bytes, n: int, r: int, p: int) -> tuple[b
     )
 
 
-# ---------------------------------------------------------------------------
 # Vault serialization
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -613,9 +603,7 @@ class Vault:
         }
 
 
-# ---------------------------------------------------------------------------
 # TOTP (RFC 6238 / RFC 4226 dynamic truncation)
-# ---------------------------------------------------------------------------
 
 
 def totp_code(secret: bytes, timestamp: int, digits: int = 6, step: int = 30, digest: str = "sha1") -> str:
@@ -645,9 +633,7 @@ def totp_remaining(timestamp: int, step: int = 30) -> int:
     return step - (timestamp % step)
 
 
-# ---------------------------------------------------------------------------
 # Share wire protocol
-# ---------------------------------------------------------------------------
 
 
 def _send_all(sock: socket.socket, data: bytes) -> None:
@@ -847,9 +833,7 @@ def share_receive(
             return _parse_share_envelope(plaintext)
 
 
-# ---------------------------------------------------------------------------
 # Secret scanner
-# ---------------------------------------------------------------------------
 
 AWS_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 PEM_RE = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
@@ -1004,9 +988,7 @@ def scan_path(root: Path, excludes: Sequence[str] = ()) -> list[ScanFinding]:
     return findings
 
 
-# ---------------------------------------------------------------------------
 # CLI helpers
-# ---------------------------------------------------------------------------
 
 
 def password_prompt(confirm: bool = False) -> str:
